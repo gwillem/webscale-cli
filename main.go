@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -265,6 +266,14 @@ func fetchLogs(token, appID, filter, from, to, logType string) error {
 		strings.ReplaceAll(params.Encode(), "+", "%20"))
 	log.Printf("GET %s", u)
 
+	// Stream CSV response to temp file
+	tmp, err := os.CreateTemp("", "webscale-logs-*.csv")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close() //nolint:errcheck
+
 	resp, err := http.Get(u)
 	if err != nil {
 		return err
@@ -276,7 +285,17 @@ func fetchLogs(token, appID, filter, from, to, logType string) error {
 		return fmt.Errorf("log download returned %d: %s", resp.StatusCode, body)
 	}
 
-	r := csv.NewReader(resp.Body)
+	n, err := io.Copy(tmp, resp.Body)
+	if err != nil {
+		return fmt.Errorf("downloading CSV: %w", err)
+	}
+	log.Printf("downloaded %d bytes to %s", n, tmp.Name())
+
+	// Read CSV header
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	r := csv.NewReader(tmp)
 	header, err := r.Read()
 	if err != nil {
 		return fmt.Errorf("reading CSV header: %w", err)
@@ -287,19 +306,48 @@ func fetchLogs(token, appID, filter, from, to, logType string) error {
 		fieldIdx[f] = i
 	}
 
-	total := 0
-	for {
-		row, err := r.Read()
-		if err == io.EOF {
-			break
+	// Collect line offsets for reverse output (API returns newest first)
+	// Re-read to find byte offsets of each line
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	scanner := bufio.NewScanner(tmp)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	var lineOffsets []int64
+	offset := int64(0)
+	isHeader := true
+	for scanner.Scan() {
+		line := scanner.Text()
+		if isHeader {
+			isHeader = false
+			offset += int64(len(line)) + 1
+			continue
 		}
+		lineOffsets = append(lineOffsets, offset)
+		offset += int64(len(line)) + 1
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scanning CSV: %w", err)
+	}
+
+	// Output in reverse order (oldest first)
+	total := len(lineOffsets)
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush()
+
+	for i := total - 1; i >= 0; i-- {
+		if _, err := tmp.Seek(lineOffsets[i], io.SeekStart); err != nil {
+			return err
+		}
+		lr := csv.NewReader(io.LimitReader(tmp, offset-lineOffsets[i]))
+		row, err := lr.Read()
 		if err != nil {
-			return fmt.Errorf("reading CSV: %w", err)
+			return fmt.Errorf("reading CSV row: %w", err)
 		}
 
 		get := func(name string) string {
-			if i, ok := fieldIdx[name]; ok && i < len(row) && row[i] != "" {
-				return row[i]
+			if j, ok := fieldIdx[name]; ok && j < len(row) && row[j] != "" {
+				return row[j]
 			}
 			return "-"
 		}
@@ -314,7 +362,7 @@ func fetchLogs(token, appID, filter, from, to, logType string) error {
 			reqPath += "?" + q
 		}
 
-		fmt.Fprintf(os.Stdout, "%s - - [%s] \"%s %s %s\" %s %s \"%s\" \"%s\"\n",
+		fmt.Fprintf(w, "%s - - [%s] \"%s %s %s\" %s %s \"%s\" \"%s\"\n",
 			get("request_address"),
 			ts,
 			get("request_method"),
@@ -325,7 +373,6 @@ func fetchLogs(token, appID, filter, from, to, logType string) error {
 			get("referrer"),
 			get("useragent"),
 		)
-		total++
 	}
 
 	log.Printf("done, %d total records", total)
