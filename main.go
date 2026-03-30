@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,13 +30,14 @@ type Options struct {
 }
 
 type LogCmd struct {
-	User   string `long:"user" required:"true" description:"Login email"`
-	Pass   string `long:"pass" required:"true" description:"Login password"`
-	Site   string `long:"site" required:"true" description:"Site domain name"`
-	Filter string `long:"filter" description:"Log filter expression"`
-	From   string `long:"from" description:"Start time (default: 30 days ago)" default:""`
-	To     string `long:"to" description:"End time (default: now)" default:""`
-	Type   string `long:"type" description:"Log type" default:"cdn"`
+	User   string   `long:"user" required:"true" description:"Login email"`
+	Pass   string   `long:"pass" required:"true" description:"Login password"`
+	Site   string   `long:"site" required:"true" description:"Site domain name"`
+	Filter []string `long:"filter" description:"Log filter expression (multiple allowed, combined with AND)"`
+	Post   bool     `long:"post" description:"Shorthand for --filter 'request_method = \"POST\"'"`
+	From   string   `long:"from" description:"Start time: RFC3339 or shorthand 30d/12h/45m (default: 30d)" default:""`
+	To     string   `long:"to" description:"End time: RFC3339 or shorthand 30d/12h/45m (default: now)" default:""`
+	Type   string   `long:"type" description:"Log type" default:"cdn"`
 }
 
 type sessionData struct {
@@ -76,16 +79,63 @@ func (cmd *LogCmd) Execute(args []string) error {
 	}
 	log.Printf("resolved %s to application %s", cmd.Site, appID)
 
-	from := cmd.From
-	to := cmd.To
-	if from == "" {
-		from = time.Now().UTC().Add(-30 * 24 * time.Hour).Format(time.RFC3339)
-	}
-	if to == "" {
-		to = time.Now().UTC().Format(time.RFC3339)
+	if cmd.Post {
+		cmd.Filter = append(cmd.Filter, `request_method = "POST"`)
 	}
 
-	return fetchLogs(token, appID, cmd.Filter, from, to, cmd.Type)
+	var filter string
+	switch len(cmd.Filter) {
+	case 0:
+	case 1:
+		filter = cmd.Filter[0]
+	default:
+		parts := make([]string, len(cmd.Filter))
+		for i, f := range cmd.Filter {
+			parts[i] = "(" + f + ")"
+		}
+		filter = strings.Join(parts, " and ")
+	}
+
+	from, err := resolveTime(cmd.From, -30*24*time.Hour)
+	if err != nil {
+		return fmt.Errorf("invalid --from: %w", err)
+	}
+	to, err := resolveTime(cmd.To, 0)
+	if err != nil {
+		return fmt.Errorf("invalid --to: %w", err)
+	}
+
+	return fetchLogs(token, appID, filter, from, to, cmd.Type)
+}
+
+// --- Time parsing ---
+
+var durationShorthandRe = regexp.MustCompile(`^(\d+)([dhm])$`)
+
+// resolveTime parses a time string as either RFC3339, a shorthand like "30d"/"12h"/"45m"
+// (interpreted as that duration ago from now), or returns now+defaultOffset if empty.
+func resolveTime(s string, defaultOffset time.Duration) (string, error) {
+	if s == "" {
+		return time.Now().UTC().Add(defaultOffset).Format(time.RFC3339), nil
+	}
+	if m := durationShorthandRe.FindStringSubmatch(s); m != nil {
+		n, _ := strconv.Atoi(m[1])
+		var unit time.Duration
+		switch m[2] {
+		case "d":
+			unit = 24 * time.Hour
+		case "h":
+			unit = time.Hour
+		case "m":
+			unit = time.Minute
+		}
+		return time.Now().UTC().Add(-time.Duration(n) * unit).Format(time.RFC3339), nil
+	}
+	// Assume RFC3339
+	if _, err := time.Parse(time.RFC3339, s); err != nil {
+		return "", fmt.Errorf("expected RFC3339 or shorthand (e.g. 30d, 12h, 45m): %q", s)
+	}
+	return s, nil
 }
 
 // --- Auth ---
@@ -271,7 +321,7 @@ func fetchLogs(token, appID, filter, from, to, logType string) error {
 	if err != nil {
 		return fmt.Errorf("creating temp file: %w", err)
 	}
-	defer os.Remove(tmp.Name())
+	defer os.Remove(tmp.Name()) //nolint:errcheck
 	defer tmp.Close() //nolint:errcheck
 
 	resp, err := http.Get(u)
@@ -333,7 +383,7 @@ func fetchLogs(token, appID, filter, from, to, logType string) error {
 	// Output in reverse order (oldest first)
 	total := len(lineOffsets)
 	w := bufio.NewWriter(os.Stdout)
-	defer w.Flush()
+	defer w.Flush() //nolint:errcheck
 
 	for i := total - 1; i >= 0; i-- {
 		if _, err := tmp.Seek(lineOffsets[i], io.SeekStart); err != nil {
@@ -362,7 +412,14 @@ func fetchLogs(token, appID, filter, from, to, logType string) error {
 			reqPath += "?" + q
 		}
 
-		fmt.Fprintf(w, "%s - - [%s] \"%s %s %s\" %s %s \"%s\" \"%s\"\n",
+		xff := get("x_forwarded_for")
+		if xff != "-" {
+			if parts := strings.Split(xff, ","); len(parts) > 1 {
+				xff = strings.TrimSpace(parts[len(parts)-1])
+			}
+		}
+
+		_, _ = fmt.Fprintf(w, "%s - - [%s] \"%s %s %s\" %s %s \"%s\" \"%s\" \"%s\" \"%s\"\n",
 			get("request_address"),
 			ts,
 			get("request_method"),
@@ -372,6 +429,8 @@ func fetchLogs(token, appID, filter, from, to, logType string) error {
 			get("bytes_out"),
 			get("referrer"),
 			get("useragent"),
+			xff,
+			get("peer_address"),
 		)
 	}
 
